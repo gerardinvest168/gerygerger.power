@@ -6,16 +6,13 @@
 #
 # Resolution order per monitor:
 #   1. hardware backlight (internal panel / DDC/CI external) via the omarchy CLI
-#   2. software dimming via hyprsunset CTM for displays with no backlight
-#      channel (e.g. external monitors without DDC). Applies to all outputs.
+#   2. software dimming via the managed hyprsunset daemon (hyprctl hyprsunset
+#      gamma) for displays with no backlight channel (e.g. external monitors
+#      without DDC). Applies to all outputs.
 
 monitor="${1:-}"
 action="${2:-get}"
 percent="${3:-}"
-
-STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/omarchy-brightness-slider"
-SOFT_FILE="$STATE_DIR/soft"
-PID_FILE="$STATE_DIR/dim.pid"
 
 [[ -n $monitor ]] || monitor="$(omarchy-hyprland-monitor-focused 2>/dev/null || true)"
 
@@ -37,71 +34,36 @@ hardware_percent() {
   brightnessctl -d "$dev" -m 2>/dev/null | awk -F, '{ gsub("%", "", $4); print $4; found=1 } END{ exit !found }'
 }
 
-# Kill any running software-dim daemon and clear its state, so the display
-# matches whatever the hardware path reports (avoids a leftover hyprsunset
-# keeping the screen dimmed after a hardware set or a compositor restart
-# stale-pid fork).
+# Clear any software-dim: Hyprland only allows a single CTM manager on the
+# compositor and the omarchy hyprsunset service (night light/blue light) owns
+# it, so the daemon itself is the dimmer. Lower the gamma to 100, leaving the
+# night-light temperature untouched (hyprsunset composes both into one CTM).
 soft_clear() {
-  local old="" pid=""
-  if [[ -r $PID_FILE ]]; then
-    old="$(cat "$PID_FILE" 2>/dev/null || true)"
-    rm -f "$PID_FILE"
-    if [[ $old =~ ^[0-9]+$ ]] && kill -0 "$old" >/dev/null 2>&1; then
-      kill "$old" >/dev/null 2>&1
-    fi
-  fi
-  rm -f "$SOFT_FILE"
+  hyprctl hyprsunset gamma 100 >/dev/null 2>&1
 }
 
-# Current software-dim level. If the dimmer daemon died (compositor restart),
-# the screen is back at 100% regardless of the stored value.
+# Current software-dim level, read straight from the daemon. Fall back to 100
+# when it is unreachable or reporting identity.
 soft_get() {
-  local stored="" pid=""
-  if [[ -r $SOFT_FILE ]]; then
-    stored="$(cat "$SOFT_FILE" 2>/dev/null || true)"
-  fi
-  if [[ -r $PID_FILE ]]; then
-    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  fi
-  if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" >/dev/null 2>&1; then
-    [[ $stored =~ ^[0-9]+$ ]] && { echo "$stored"; return 0; }
-  fi
+  local g=""
+  g="$(hyprctl hyprsunset gamma 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
+  [[ $g =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(printf '%.0f' "$g") >= 0 && $(printf '%.0f' "$g") <= 100 )) && { printf '%.0f\n' "$g"; return 0; }
   echo 100
 }
 
 soft_set() {
-  local p="$1" old="" pid=""
-
-  mkdir -p "$STATE_DIR" 2>/dev/null || true
-
-  if [[ -r $PID_FILE ]]; then
-    old="$(cat "$PID_FILE" 2>/dev/null || true)"
-    rm -f "$PID_FILE"
-    if [[ $old =~ ^[0-9]+$ ]] && kill -0 "$old" >/dev/null 2>&1; then
-      kill "$old" >/dev/null 2>&1
-    fi
-  fi
-
-  printf '%s\n' "$p" > "$SOFT_FILE"
-
+  local p="$1"
   if (( p >= 100 )); then
-    # Full brightness: release the manager entirely (resets CTM to identity).
-    echo "$p"
+    soft_clear
+    echo 100
     return 0
   fi
-
-  # Detach so the daemon outlives this script (Quickshell reaps the direct
-  # child). setsid gives it its own session, immune to group-wide kills.
-  setsid hyprsunset -g "$p" >/dev/null 2>&1 < /dev/null &
-  pid=$!
-  printf '%s\n' "$pid" > "$PID_FILE"
-  disown "$pid" 2>/dev/null || true
-
-  echo "$p"
+  hyprctl hyprsunset gamma "$p" >/dev/null 2>&1
+  soft_get
 }
 
 if [[ $action == "get" ]]; then
-  hardware_percent && soft_clear && exit 0
+  hardware_percent && exit 0
   soft_get
   exit 0
 fi
