@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "id": "gerygerger.power",
-  "name": "My Power",
+  "name": "Asus Battery & Display",
   "version": "1.0.0",
-  "author": "Omarchy",
-  "description": "Battery, power profile, and system stats",
+  "author": "Gerygerger",
+  "description": "Asus Battery & Display Control by Gerygerger — battery, power profile, charge limit, brightness, auto-dim, and idle settings",
   "kinds": [
     "bar-widget"
   ],
@@ -12,8 +12,8 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "My Power",
-    "description": "Battery, power profile, and system stats",
+    "displayName": "Asus Battery & Display",
+    "description": "Asus Battery & Display Control by Gerygerger",
     "category": "System",
     "allowMultiple": false
   },

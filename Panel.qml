@@ -8,7 +8,7 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "omarchy.power"
+  moduleName: "asus.gerygerger.power"
   ipcTarget: "omarchy.power"
   // manageIpc: false so this panel can own the single IpcHandler the target
   // permits — needed for the togglePercentage method below.
@@ -20,6 +20,52 @@ Panel {
   property int profileIndex: 0
   property int chargeLimit: -1
   property bool cursorActive: false
+  property bool chargeLimitVerified: false
+
+  // ---------- Auto-dim ----------
+  // When enabled, fades brightness to autoDimTarget% after
+  // autoDimThreshold seconds of no input activity (keyboard/mouse),
+  // and restores it when activity resumes.
+  property bool autoDimEnabled: setting("autoDimEnabled", false) === true
+  property int autoDimThreshold: parseInt(setting("autoDimThreshold", "300"), 10) // default 5 min
+  property int autoDimTarget: parseInt(setting("autoDimTarget", "50"), 10)         // default 50%
+  property bool autoDimActive: false          // true while we've dimmed
+  property int autoDimFrom: 100              // brightness we dimmed from (for restore)
+  readonly property string idleCheckScript: Quickshell.env("HOME") + "/.config/omarchy/plugins/gerygerger.power/idle-check.sh"
+  Timer {
+    id: autoDimTimer
+    interval: 10000                       // poll every 10 s
+    running: root.autoDimEnabled
+    repeat: true
+    triggeredOnStart: false
+    onTriggered: root.runAutoDimCheck()
+  }
+  function runAutoDimCheck() {
+    if (!root.brightnessAvailable) return
+    idleProc.running = true
+  }
+
+  // ---------- Charge limit monitor ----------
+  // Polls every 5 minutes. If the charge limit is set, the battery is on
+  // AC power, and the battery percentage is above the limit while charging,
+  // re-applies the limit to force the EC to stop charging.
+  Timer {
+    id: chargeLimitMonitorTimer
+    interval: 300000                      // 5 minutes
+    running: root.chargeThresholdActive && root.chargeLimit > 0
+    repeat: true
+    triggeredOnStart: false
+    onTriggered: root.monitorChargeLimit()
+  }
+
+  function monitorChargeLimit() {
+    if (!root.chargeThresholdActive || root.chargeLimit <= 0) return
+    if (!root.batteryInfo.percentage) return
+    var pct = parseInt(String(root.batteryInfo.percentage), 10)
+    if (pct > root.chargeLimit && !root.discharging && root.batteryInfo.rate > 0) {
+      applyChargeLimit(root.chargeLimit)
+    }
+  }
   readonly property var chargeLimitOptions: [
     { percent: 50, label: "50%" },
     { percent: 80, label: "80%" },
@@ -33,6 +79,11 @@ Panel {
   property bool showOsdOnNextSet: false
   readonly property string brightnessScript: Quickshell.env("HOME") + "/.config/omarchy/plugins/gerygerger.power/brightness.sh"
   readonly property bool showPercentage: setting("showPercentage", false) === true
+  // Idle config — mirrors ~/.config/omarchy/shell.json "idle" block.
+  readonly property string readIdleScript: Quickshell.env("HOME") + "/.config/omarchy/plugins/gerygerger.power/read-idle-config.sh"
+  readonly property string updateIdleScript: Quickshell.env("HOME") + "/.config/omarchy/plugins/gerygerger.power/update-idle-config.sh"
+  property int idleScreensaver: 150   // seconds; 0 disables the screensaver
+  property int idleLock: 300          // seconds; 0 disables locking
   // With the percentage shown the button paints a text block wider than an
   // icon, so the open-panel mark takes the painted width instead of the
   // icon-sized fraction of the slot the fallback assumes.
@@ -187,13 +238,27 @@ Panel {
   function applyChargeLimit(percent) {
     if (limitProc.running) return
     chargeLimit = percent
-    limitProc.command = ["asusctl", "battery", "limit", String(percent)]
+    // Apply via asusctl AND sync the kernel's charge_control_end_threshold
+    // so both the ASUS EC and the kernel enforce the same limit.
+    var bashCmd = "asusctl battery limit " + String(percent)
+    for (var i = 0; i < 3; i++) {
+      bashCmd += " && echo " + String(percent) + " > /sys/class/power_supply/BAT" + String(i) + "/charge_control_end_threshold 2>/dev/null || true"
+    }
+    limitProc.command = ["bash", "-c", bashCmd]
     limitProc.running = true
   }
 
   function parseChargeLimit(raw) {
     var match = String(raw || "").match(/(\d+)\s*%/)
     if (match) chargeLimit = parseInt(match[1], 10)
+  }
+
+  function verifyChargeLimit() {
+    // Read back the kernel's charge_control_end_threshold and compare
+    // to what we just set. If they match, the limit is verified.
+    if (chargeLimit <= 0) { chargeLimitVerified = false; return }
+    var ec = parseInt(String(batteryInfo.threshold || "-1"), 10)
+    chargeLimitVerified = (ec === chargeLimit)
   }
 
   function clampBrightness(value) {
@@ -217,10 +282,21 @@ Panel {
   function setBrightness(value, withOsd) {
     var percent = clampBrightness(value)
     root.brightness = percent
+    if (root.autoDimActive) root.autoDimFrom = percent
     if (brightnessSetProc.running) return
     root.showOsdOnNextSet = withOsd === true
     brightnessSetProc.command = ["bash", root.brightnessScript, "", "set", String(percent)]
     brightnessSetProc.running = true
+  }
+
+  function toggleAutoDim() {
+    root.autoDimEnabled = !root.autoDimEnabled
+    root.settings = Object.assign({}, root.settings, { autoDimEnabled: root.autoDimEnabled })
+    if (!root.autoDimEnabled && root.autoDimActive) {
+      root.setBrightness(root.autoDimFrom, false)
+      root.autoDimActive = false
+    }
+    if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, root.settings)
   }
 
   function showBrightnessOsd(percent) {
@@ -231,6 +307,31 @@ Panel {
   function togglePercentage() {
     root.settings = Object.assign({}, root.settings, { showPercentage: !root.showPercentage })
     if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+  }
+
+  // ---------- Idle config helpers ----------
+  property var idleConfig: ({ screensaver: 150, lock: 300 })
+
+  function setIdleScreensaver(seconds) {
+    root.idleScreensaver = seconds
+    root.settings = Object.assign({}, root.settings, {
+      idleScreensaver: seconds,
+      idleLock: root.idleLock
+    })
+    if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+    idleWriteProc.command = ["bash", "-c", root.updateIdleScript + " screensaver " + String(seconds)]
+    idleWriteProc.running = true
+  }
+
+  function setIdleLock(seconds) {
+    root.idleLock = seconds
+    root.settings = Object.assign({}, root.settings, {
+      idleScreensaver: root.idleScreensaver,
+      idleLock: seconds
+    })
+    if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+    idleWriteProc.command = ["bash", "-c", root.updateIdleScript + " lock " + String(seconds)]
+    idleWriteProc.running = true
   }
 
   IpcHandler {
@@ -255,6 +356,7 @@ Panel {
       var idx = profiles.indexOf(activeProfile)
       profileIndex = idx >= 0 ? idx : 0
       cursorActive = false
+      if (!idleConfigProc.running) idleConfigProc.running = true
     }
   }
 
@@ -290,7 +392,7 @@ Panel {
   Process {
     id: limitInfoProc
     command: ["asusctl", "battery", "info"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.parseChargeLimit(text) }
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: { root.parseChargeLimit(text); root.verifyChargeLimit() } }
   }
 
   Process {
@@ -319,6 +421,27 @@ Panel {
   }
 
   Process {
+    id: idleProc
+    command: ["bash", root.idleCheckScript]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var idleSecs = parseInt(String(text || "").trim(), 10)
+        if (!isFinite(idleSecs) || idleSecs < 0) idleSecs = 0
+        var threshold = root.autoDimThreshold
+        if (idleSecs >= threshold && !root.autoDimActive) {
+          root.autoDimFrom = root.brightness
+          root.setBrightness(root.autoDimTarget, false)
+          root.autoDimActive = true
+        } else if (idleSecs < threshold && root.autoDimActive) {
+          root.setBrightness(root.autoDimFrom, false)
+          root.autoDimActive = false
+        }
+      }
+    }
+  }
+
+  Process {
     id: brightnessSetProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -332,6 +455,30 @@ Panel {
         root.showOsdOnNextSet = false
         root.showBrightnessOsd(root.brightness)
       }
+  }
+
+  // ---------- Idle config reader/writer ----------
+  Process {
+    id: idleConfigProc
+    command: ["bash", "-c", root.readIdleScript]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var data = JSON.parse(String(text || "{}"))
+          if (data.screensaver !== undefined) root.idleScreensaver = data.screensaver
+          if (data.lock !== undefined) root.idleLock = data.lock
+        } catch (e) {}
+      }
+    }
+  }
+
+  Process {
+    id: idleWriteProc
+    onExited: {
+      // Re-read after write to keep state consistent
+      if (!idleConfigProc.running) idleConfigProc.running = true
+    }
   }
 
   Timer { interval: 5000; running: root.opened; repeat: true; onTriggered: root.refresh() }
@@ -463,7 +610,7 @@ Panel {
             spacing: Style.space(2)
 
             Text {
-              text: "Battery"
+              text: "Asus Battery & Display"
               color: root.bar.foreground
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.title
@@ -475,7 +622,7 @@ Panel {
             Text {
               id: heroStatus
               textFormat: Text.PlainText
-              text: root.heroStatusText.toUpperCase()
+              text: "Control by Gerygerger"
               color: Qt.darker(root.bar.foreground, 1.4)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.caption
@@ -563,7 +710,7 @@ Panel {
             }
             InfoPair {
               label: root.chargeThresholdActive ? "Battery state" : (root.discharging ? "Discharging" : "Charging")
-              value: root.chargeThresholdActive ? "Holding" : (root.batteryFull ? "-" : (root.batteryInfo.rate || ""))
+              value: root.chargeThresholdActive ? (root.chargeLimitVerified ? "Holding ✓" : "Holding ⚠") : (root.batteryFull ? "-" : (root.batteryInfo.rate || ""))
             }
           }
         }
@@ -587,8 +734,6 @@ Panel {
               text: "BRIGHTNESS"
               foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
             }
 
             Text {
@@ -631,6 +776,157 @@ Panel {
               onReleased: function(value) {
                 root.sliderDragging = false
                 root.setBrightness(value, false)
+              }
+            }
+          }
+
+          // ---------- Auto-dim toggle + editor ----------
+          Row {
+            visible: root.brightnessAvailable
+            width: parent.width
+            spacing: Style.space(8)
+            y: brightnessRow.implicitHeight + Style.space(4)
+
+            Text {
+              id: autoDimLabel
+              text: "Auto-dim"
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              opacity: root.autoDimEnabled ? 1.0 : 0.35
+              verticalAlignment: Text.AlignVerticalCenter
+              Behavior on opacity { NumberAnimation { duration: 150 } }
+            }
+
+            // Click to toggle on/off
+            Text {
+              property int chipWidth: 56
+              x: 0
+              color: root.autoDimEnabled ? root.bar.foreground : Qt.rgba(0.4, 0.4, 0.4, 0.5)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: root.autoDimEnabled
+              text: root.autoDimEnabled ? (root.autoDimActive ? "ON ●" : "ON  ") : "OFF"
+              Behavior on color { ColorAnimation { duration: 150 } }
+              Behavior on text { NumberAnimation { duration: 150 } }
+
+              MouseArea {
+                anchors.fill: parent
+                onClicked: root.toggleAutoDim()
+              }
+            }
+
+            // Threshold editor (minutes + Off)
+            Row {
+              visible: root.autoDimEnabled
+              width: parent.width
+              spacing: Style.space(4)
+
+              Repeater {
+                model: [
+                  { label: "5m",  seconds: 300  },
+                  { label: "15m", seconds: 900  },
+                  { label: "30m", seconds: 1800 },
+                  { label: "1 Hr", seconds: 3600 },
+                  { label: "Off",  seconds: 0    }
+                ]
+                Text {
+                  required property var modelData
+                  text: modelData.label
+                  color: root.autoDimThreshold === modelData.seconds
+                    ? root.bar.foreground
+                    : Qt.rgba(0.45, 0.45, 0.45, 0.6)
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: root.autoDimThreshold === modelData.seconds
+                  verticalAlignment: Text.AlignVerticalCenter
+                  Behavior on color { ColorAnimation { duration: 120 } }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                      root.autoDimThreshold = modelData.seconds
+                      root.settings = Object.assign({}, root.settings, {
+                        autoDimThreshold: modelData.seconds,
+                        autoDimTarget: root.autoDimTarget,
+                        autoDimEnabled: root.autoDimEnabled
+                      })
+                      if (root.bar && root.bar.shell)
+                        root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+                    }
+                  }
+                }
+              }
+            }
+
+            // Target editor (percent)
+            Row {
+              visible: root.autoDimEnabled
+              spacing: Style.space(2)
+              height: 20
+
+              Text {
+                text: "→"
+                color: Qt.rgba(0.55, 0.55, 0.55, 1.0)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                verticalAlignment: Text.AlignVerticalCenter
+              }
+
+              Text {
+                text: root.autoDimTarget + "%"
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                verticalAlignment: Text.AlignVerticalCenter
+              }
+
+              Text {
+                text: "−"
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                verticalAlignment: Text.AlignVerticalCenter
+
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: {
+                    var v = root.autoDimTarget - 5
+                    if (v < 5) v = 5
+                    root.autoDimTarget = v
+                    root.settings = Object.assign({}, root.settings, {
+                      autoDimThreshold: root.autoDimThreshold,
+                      autoDimTarget: v,
+                      autoDimEnabled: root.autoDimEnabled
+                    })
+                    if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+                  }
+                }
+              }
+
+              Text {
+                text: "+"
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                verticalAlignment: Text.AlignVerticalCenter
+
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: {
+                    var v = root.autoDimTarget + 5
+                    if (v > 100) v = 100
+                    root.autoDimTarget = v
+                    root.settings = Object.assign({}, root.settings, {
+                      autoDimThreshold: root.autoDimThreshold,
+                      autoDimTarget: v,
+                      autoDimEnabled: root.autoDimEnabled
+                    })
+                    if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+                  }
+                }
               }
             }
           }
@@ -727,6 +1023,128 @@ Panel {
                 bordered: true
                 active: root.chargeLimit === modelData.percent
                 onClicked: root.applyChargeLimit(modelData.percent)
+              }
+            }
+          }
+        }
+
+        // ---------- Idle config ----------
+        PanelSeparator {
+          foreground: root.bar.foreground
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(8)
+
+          PanelSectionHeader {
+            text: "IDLE"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+          }
+
+          // Screensaver timeout
+          Row {
+            width: parent.width
+            spacing: Style.space(6)
+
+            Text {
+              text: "Screensaver"
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              opacity: 0.7
+              verticalAlignment: Text.AlignVerticalCenter
+              width: parent.width * 0.28
+            }
+
+            Repeater {
+              model: [
+                { label: "5m",  seconds: 300  },
+                { label: "15m", seconds: 900  },
+                { label: "30m", seconds: 1800 },
+                { label: "1 Hr", seconds: 3600 },
+                { label: "Off",  seconds: 0    }
+              ]
+              Text {
+                required property var modelData
+                text: modelData.label
+                color: root.idleScreensaver === modelData.seconds
+                  ? root.bar.foreground
+                  : Qt.rgba(0.45, 0.45, 0.45, 0.6)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: root.idleScreensaver === modelData.seconds
+                verticalAlignment: Text.AlignVerticalCenter
+                Behavior on color { ColorAnimation { duration: 120 } }
+
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: {
+                    root.idleScreensaver = modelData.seconds
+                    root.settings = Object.assign({}, root.settings, {
+                      idleScreensaver: modelData.seconds,
+                      idleLock: root.idleLock
+                    })
+                    if (root.bar && root.bar.shell)
+                      root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+                    idleWriteProc.command = ["bash", "-c", root.updateIdleScript + " screensaver " + String(modelData.seconds)]
+                    idleWriteProc.running = true
+                  }
+                }
+              }
+            }
+          }
+
+          // Lock timeout
+          Row {
+            width: parent.width
+            spacing: Style.space(6)
+
+            Text {
+              text: "Lock"
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              opacity: 0.7
+              verticalAlignment: Text.AlignVerticalCenter
+              width: parent.width * 0.28
+            }
+
+            Repeater {
+              model: [
+                { label: "5m",  seconds: 300  },
+                { label: "15m", seconds: 900  },
+                { label: "30m", seconds: 1800 },
+                { label: "1 Hr", seconds: 3600 },
+                { label: "Off",  seconds: 0    }
+              ]
+              Text {
+                required property var modelData
+                text: modelData.label
+                color: root.idleLock === modelData.seconds
+                  ? root.bar.foreground
+                  : Qt.rgba(0.45, 0.45, 0.45, 0.6)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: root.idleLock === modelData.seconds
+                verticalAlignment: Text.AlignVerticalCenter
+                Behavior on color { ColorAnimation { duration: 120 } }
+
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: {
+                    root.idleLock = modelData.seconds
+                    root.settings = Object.assign({}, root.settings, {
+                      idleScreensaver: root.idleScreensaver,
+                      idleLock: modelData.seconds
+                    })
+                    if (root.bar && root.bar.shell)
+                      root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+                    idleWriteProc.command = ["bash", "-c", root.updateIdleScript + " lock " + String(modelData.seconds)]
+                    idleWriteProc.running = true
+                  }
+                }
               }
             }
           }
