@@ -1,6 +1,6 @@
 #!/bin/bash
 # idle-tracker.sh — background activity tracker for auto-dim.
-# Listens to hyprctl monitor events and updates the last-activity
+# Listens to Hyprland socket2 input events and updates the last-activity
 # timestamp that idle-check.sh reads.
 #
 # Add to Hyprland autostart (e.g. ~/.config/hypr/autostart.lua):
@@ -15,9 +15,18 @@ touch "$ACTIVITY_FILE"
 # stale data from before the daemon was running.
 date +%s > "$ACTIVITY_FILE"
 
-# hyprctl monitor streams events; any input event counts as activity.
-hyprctl monitor 2>/dev/null | while IFS= read -r line; do
-    if echo "$line" | grep -qiE 'keydown|keyup|mousemove|mousein|mouseout|scroll|touch|touchdown|touchup'; then
-        date +%s > "$ACTIVITY_FILE"
-    fi
-done
+# hyprctl has no blocking monitor/event command ("unknown request"), so
+# stream input events from Hyprland's socket2 instead. Any keyboard, mouse,
+# scroll, or touch event counts as activity.
+SOCKET="$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
+
+if [[ ! -S "$SOCKET" ]]; then
+  echo "idle-tracker: hyprland event socket not found at $SOCKET" >&2
+  exit 1
+fi
+
+while IFS= read -r line; do
+  if [[ $line =~ ^(keyboardkey|mousebutton|mousemov|mousemot|scroll|touch|pinch|swipe|mousezoom) ]]; then
+    date +%s > "$ACTIVITY_FILE"
+  fi
+done < <(socat -U - "UNIX-CONNECT:$SOCKET")

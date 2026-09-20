@@ -41,7 +41,7 @@ Panel {
     onTriggered: root.runAutoDimCheck()
   }
   function runAutoDimCheck() {
-    if (!root.brightnessAvailable) return
+    if (!root.brightnessAvailable || root.autoDimThreshold <= 0) return
     idleProc.running = true
   }
 
@@ -429,13 +429,14 @@ Panel {
         var idleSecs = parseInt(String(text || "").trim(), 10)
         if (!isFinite(idleSecs) || idleSecs < 0) idleSecs = 0
         var threshold = root.autoDimThreshold
+        if (threshold <= 0) return  // "Off": never auto-dim
         if (idleSecs >= threshold && !root.autoDimActive) {
           root.autoDimFrom = root.brightness
           root.setBrightness(root.autoDimTarget, false)
           root.autoDimActive = true
         } else if (idleSecs < threshold && root.autoDimActive) {
-          root.setBrightness(root.autoDimFrom, false)
           root.autoDimActive = false
+          root.setBrightness(root.autoDimFrom, false)
         }
       }
     }
